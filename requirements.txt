@@ -2,6 +2,7 @@ flask
 flask-cors
 python-dotenv
 langchain
+langchain_community
 openai
 qdrant-client
 edge-tts
