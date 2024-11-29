@@ -7,11 +7,12 @@ from typing import Dict, Any
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
-from langchain.chains import RetrievalQA
+from langchain.chains import RetrievalQA, ConversationalRetrievalChain
 from langchain.chat_models import ChatOpenAI
 from langchain.vectorstores import Qdrant
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferWindowMemory
 import qdrant_client
 import edge_tts
 
@@ -21,7 +22,6 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__, static_folder='.')
 CORS(app)
-
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,6 +33,14 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TTS_VOICE = os.getenv("TTS_VOICE", "id-ID-ArdiNeural")  # Default to Indonesian voice
+
+# Initialize conversation memory with larger window size
+memory = ConversationBufferWindowMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    output_key="answer",
+    k=10  # Increased to keep last 10 conversations for better context
+)
 
 def get_vector_store() -> Qdrant:
     """Initialize and return the Qdrant vector store."""
@@ -56,41 +64,50 @@ def get_vector_store() -> Qdrant:
         logger.error(f"Error in get_vector_store: {str(e)}")
         raise
 
-def create_qa_chain(vector_store: Qdrant) -> RetrievalQA:
-    """Create and return the question-answering chain."""
+def create_qa_chain(vector_store: Qdrant) -> ConversationalRetrievalChain:
+    """Create and return the conversational question-answering chain."""
     prompt_template = """
-    Anda adalah Klaris, asisten virtual Universitas Klabat. Ikuti pedoman berikut:
+    Anda adalah Klaris, asisten virtual cerdas dan ramah dari Universitas Klabat. Ikuti pedoman berikut:
 
-    1. Jawab pertanyaan dengan singkat namun akurat, maksimal 200 karakter.
-    2. Gunakan data resmi Universitas Klabat. Jika tidak yakin, nyatakan keterbatasan informasi.
-    3. Tangani pertanyaan ganda dengan cermat, menjawab setiap bagian.
-    4. Prioritaskan informasi terkini tentang akademik, admisi, dan kehidupan kampus.
-    5. Gunakan bahasa formal dan sopan, sesuai budaya akademik.
-    6. Tawarkan bantuan lebih lanjut atau rujukan ke sumber resmi jika diperlukan.
-    7. Sesuaikan respons dengan konteks pertanyaan (mahasiswa, calon mahasiswa, dll).
+    1. Berikan jawaban yang singkat, padat, dan informatif.
+    2. Gunakan data resmi Universitas Klabat dan nyatakan dengan jelas jika informasi terbatas.
+    3. Jawab pertanyaan dengan gaya yang profesional namun bersahabat.
+    4. Fokus pada informasi yang diminta tanpa menambahkan detail yang tidak perlu.
+    5. Untuk pertanyaan tentang personel (seperti dekan, dosen):
+       - Sebutkan nama lengkap dengan gelar akademis
+       - Jika ditanya tentang gelar, jelaskan secara spesifik
+       - Jika ada komentar positif tentang jawaban sebelumnya, berikan respon yang sesuai konteks
+    6. Untuk pertanyaan tentang program studi/jurusan:
+       - Berikan informasi lengkap dengan singkatan resmi
+       - Sebutkan detail penting seperti akreditasi jika relevan
+    7. Jika ada pertanyaan "ulangi", berikan jawaban sebelumnya dengan lebih ringkas dan tepat.
+    8. Hindari menambahkan frasa basa-basi seperti "Apakah ada yang ingin ditanyakan lebih lanjut?"
+    9. Gunakan bahasa Indonesia yang baik dan benar.
+    10. Pastikan setiap jawaban akurat dan terkini.
+    11. Pahami konteks percakapan sebelumnya dan berikan respon yang sesuai untuk komentar atau pujian.
+    12. Perhatikan alur percakapan dan berikan jawaban yang berkesinambungan dengan topik yang sedang dibahas.
 
-    *jawab sesuai dengan apa yang ditanya saja, contoh pertanyaan:
-    apa saja matakuliah semeseter 1 jurusan informatika:
-    jawaban: sebutkan nama matakuliahnya tanpa prerequiset matakuliahnya.
-
-    konteks: {context}
-    pertanyaan: {question}
-    jawaban:
+    Riwayat Chat sebelumnya: {chat_history}
+    Konteks tambahan: {context}
+    Pertanyaan saat ini: {question}
+    
+    Berikan jawaban yang profesional dan informatif:
     """
 
     PROMPT = PromptTemplate(
-        template=prompt_template, input_variables=["context", "question"]
+        template=prompt_template, 
+        input_variables=["context", "question", "chat_history"]
     )
 
-    chain_type_kwargs = {"prompt": PROMPT}
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+    retriever = vector_store.as_retriever(search_kwargs={"k": 10})  # Increased for more context
 
-    qa = RetrievalQA.from_chain_type(
+    qa = ConversationalRetrievalChain.from_llm(
         llm=ChatOpenAI(model='gpt-4o-mini', temperature=0.7, openai_api_key=OPENAI_API_KEY),
-        chain_type="stuff",
         retriever=retriever,
-        chain_type_kwargs=chain_type_kwargs,
-        return_source_documents=True
+        memory=memory,
+        return_source_documents=True,
+        combine_docs_chain_kwargs={'prompt': PROMPT},
+        verbose=True
     )
 
     return qa
@@ -128,12 +145,13 @@ def process_speech():
         qa_chain = create_qa_chain(vector_store)
 
         logger.info(f"Processing query: {text}")
-        result = qa_chain({"query": text})
+        logger.info(f"Current chat history: {memory.chat_memory.messages}")
+        
+        result = qa_chain({"question": text})
 
-        answer = result['result']
-        logger.info(f"Answer generated: {answer[:50]}...")  # Log first 50 characters
+        answer = result['answer']
+        logger.info(f"Answer generated: {answer[:50]}...")
 
-        # Generate TTS
         audio_file = asyncio.run(text_to_speech(answer))
         audio_filename = os.path.basename(audio_file)
 

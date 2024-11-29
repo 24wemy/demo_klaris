@@ -7,3 +7,4 @@ openai
 qdrant-client
 edge-tts
 tiktoken
+langchain_openai
